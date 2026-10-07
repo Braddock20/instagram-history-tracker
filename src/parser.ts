@@ -1,5 +1,6 @@
 import { unzipSync } from "fflate";
 import { usernameFromEntry } from "./normalize";
+import { asInt } from "./db";
 import type { Env, ParsedExport } from "./types";
 
 function json(bytes: Uint8Array) {
@@ -19,7 +20,9 @@ function isFollowing(path: string) {
 export function parseInstagramZip(bytes: Uint8Array, env: Env): ParsedExport {
   const files = unzipSync(bytes);
   const names = Object.keys(files);
-  const maxFiles = Number(env.MAX_USERNAME_COUNT || 5000) * 2;
+  // Was: Number(env.MAX_USERNAME_COUNT || 5000) * 2, which ignored MAX_ZIP_FILES
+  // entirely and let a zip-bomb with a million entries through.
+  const maxFiles = asInt(env.MAX_ZIP_FILES, 5000);
   if (names.length > maxFiles) throw new Error(`ZIP contains ${names.length} files; maximum is ${maxFiles}`);
 
   const jsonNames = names.filter(n => n.toLowerCase().endsWith(".json"));
