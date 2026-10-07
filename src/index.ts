@@ -10,6 +10,9 @@ import { UI } from "./ui";
 const VERSION = "2.0.0";
 const app = new Hono<{ Bindings: Env }>();
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const EVENT_TYPES: string[] = ["followed_you", "unfollowed_you", "you_followed", "you_unfollowed"];
+
 app.use("*", cors({ origin: "*", allowHeaders: ["Content-Type", "X-API-Key"], allowMethods: ["GET", "POST", "DELETE", "OPTIONS"] }));
 app.use("*", async (c, next) => {
   if (c.req.path === "/health" || c.req.path === "/api/v1/meta") return next();
@@ -22,7 +25,9 @@ function jsonError(message: string, status = 400, extra: Record<string, unknown>
 }
 
 async function sha256(bytes: Uint8Array) {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  // Cast: TS models Uint8Array as ArrayBufferLike, crypto.subtle wants a plain
+  // ArrayBuffer view. Pre-existing type error that broke `npm run typecheck`.
+  const digest = await crypto.subtle.digest("SHA-256", bytes as unknown as BufferSource);
   return [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
@@ -34,14 +39,30 @@ async function finalize(env: Env, importId: string) {
 
 async function enqueueOrFinalize(env: Env, importId: string) {
   if (env.IMPORT_QUEUE) {
+    // Claim the import BEFORE publishing. Publishing first leaves a window in
+    // which the consumer finalises the import and this UPDATE then overwrites
+    // the freshly written 'valid' status back to 'queued'. The status guard
+    // also keeps a late call from clobbering 'valid'/'failed'.
+    await db(env)`update imports set status='queued' where id=${importId}::uuid and status in ('staging','processing')`;
     await env.IMPORT_QUEUE.send({ importId, kind: "finalize" } satisfies ImportQueueMessage);
-    await db(env)`update imports set status='queued' where id=${importId}`;
     return { status: "queued", import_id: importId };
   }
   return await finalize(env, importId);
 }
 
+// Reject non-UUID path parameters up front. Without this, Postgres raises 22P02
+// ("invalid input syntax for type uuid") and the client gets a 500 instead of a
+// useful 4xx.
+app.use("/api/v1/accounts/:id/*", async (c, next) => {
+  if (!UUID_RE.test(c.req.param("id"))) return jsonError("invalid_account_id", 400);
+  // /imports/:importId/... carries a second UUID; /imports/init is a literal.
+  const segment = c.req.path.match(/^\/api\/v1\/accounts\/[^/]+\/imports\/([^/]+)\//)?.[1];
+  if (segment && segment !== "init" && !UUID_RE.test(segment)) return jsonError("invalid_import_id", 400);
+  return next();
+});
+
 app.get("/", c => c.html(UI));
+
 app.get("/health", async c => {
   try { await db(c.env)`select 1`; return c.json({ ok: true, version: VERSION, parser_version: VERSION }); }
   catch (e) { return c.json({ ok: false, error: e instanceof Error ? e.message : String(e) }, 503); }
@@ -74,8 +95,10 @@ app.post("/api/v1/accounts/:id/imports/init", async c => {
   const id = c.req.param("id");
   const sql = db(c.env);
   if (!(await sql`select id from instagram_accounts where id=${id}`).length) return jsonError("account_not_found", 404);
-  const body = (await c.req.json().catch(() => ({}))) as any;
-  const filename = String(body.filename || "instagram-export.zip").slice(0, 255);
+  const body = (await c.req.json().catch(() => null)) as any;
+  if (!body || typeof body !== "object") return jsonError("invalid_json");
+  if (body.filename != null && typeof body.filename !== "string") return jsonError("invalid_filename");
+  const filename = String(body.filename || "instagram-export.zip").trim().slice(0, 255) || "instagram-export.zip";
   const observedAt = body.observed_at ? new Date(body.observed_at) : new Date();
   if (Number.isNaN(observedAt.getTime())) return jsonError("invalid_observed_at");
   const sha = body.sha256 ? String(body.sha256).toLowerCase() : null;
@@ -84,8 +107,29 @@ app.post("/api/v1/accounts/:id/imports/init", async c => {
     const dup = await sql`select id,status,snapshot_id,observed_at from imports where account_id=${id} and sha256=${sha} limit 1`;
     if (dup.length) return c.json({ duplicate: true, import: dup[0] });
   }
-  const rows = await sql`insert into imports(account_id,original_filename,sha256,observed_at,status,parser_version) values(${id},${filename},${sha},${observedAt.toISOString()},'staging',${VERSION}) returning id,account_id,original_filename,observed_at,status,parser_version,created_at`;
-  await sql`insert into audit_log(account_id,action,details) values(${id},'import_started',jsonb_build_object('import_id',${rows[0].id},'filename',${filename}))`;
+  let rows: any[];
+  try {
+    rows = await sql`insert into imports(account_id,original_filename,sha256,observed_at,status,parser_version) values(${id},${filename},${sha},${observedAt.toISOString()},'staging',${VERSION}) returning id,account_id,original_filename,observed_at,status,parser_version,created_at`;
+  } catch (e: any) {
+    // unique(account_id, sha256): a concurrent init won the race. Report it as a
+    // duplicate instead of surfacing a 500 to the browser.
+    if (e?.code === "23505" && sha) {
+      const dup = await sql`select id,status,snapshot_id,observed_at from imports where account_id=${id} and sha256=${sha} limit 1`;
+      if (dup.length) return c.json({ duplicate: true, import: dup[0] });
+    }
+    throw e;
+  }
+  // FIX (the "$2" bug): jsonb_build_object() is VARIADIC "any", so PostgreSQL
+  // cannot infer a type for a bare parameter inside it. $2 was import_id and $3
+  // was filename -- both untyped -> "could not determine data type of parameter
+  // $2". Cast both. (Casting only $2 would just move the error to $3.)
+  try {
+    await sql`insert into audit_log(account_id,action,details) values(${id},'import_started',jsonb_build_object('import_id',${rows[0].id}::text,'filename',${filename}::text))`;
+  } catch (e) {
+    // The import row already exists. An audit failure must not orphan it, or
+    // the sha256 duplicate check would reject the client's retry.
+    console.error("audit_log write failed for import", rows[0].id, e);
+  }
   return c.json(rows[0], 201);
 });
 
@@ -101,7 +145,13 @@ app.post("/api/v1/accounts/:id/imports", async c => {
   const digest = await sha256(bytes);
   const duplicate = await db(c.env)`select id,status,snapshot_id from imports where account_id=${id} and sha256=${digest} limit 1`;
   if (duplicate.length) return c.json({ duplicate: true, import: duplicate[0] });
-  const parsed = parseInstagramZip(bytes, c.env);
+  // A malformed/unsupported export is a client problem, not a server fault.
+  let parsed: ReturnType<typeof parseInstagramZip>;
+  try {
+    parsed = parseInstagramZip(bytes, c.env);
+  } catch (e) {
+    return jsonError(e instanceof Error ? e.message : "could not parse archive", 400);
+  }
   if (parsed.followers.size > max || parsed.following.size > max) return jsonError("username_limit_exceeded", 413);
   const init = await db(c.env)`insert into imports(account_id,original_filename,sha256,observed_at,status,parser_version,discovered_files,follower_files,following_files,warnings) values(${id},${file.name || "instagram-export.zip"},${digest},now(),'staging',${VERSION},${JSON.stringify(parsed.discoveredFiles)}::jsonb,${JSON.stringify(parsed.followerFiles)}::jsonb,${JSON.stringify(parsed.followingFiles)}::jsonb,${JSON.stringify(parsed.warnings)}::jsonb) returning id`;
   const importId = init[0].id as string;
@@ -267,7 +317,12 @@ app.get("/api/v1/accounts/:id/analytics/churn", async c => {
 app.get("/api/v1/accounts/:id/changes", async c => {
   const limit = Math.min(1000, Math.max(1, Number(c.req.query('limit') || 200)));
   const type = c.req.query('type');
-  const rows = await db(c.env)`select e.id,e.event_type,p.username,e.occurred_after,e.occurred_before,e.snapshot_id from events e join people p on p.id=e.person_id where e.account_id=${c.req.param("id")} and (${type || null} is null or e.event_type=${type || null}) and not exists(select 1 from exclusion_entries x where x.account_id=e.account_id and x.username=p.username) order by e.occurred_before desc limit ${limit}`;
+  if (type && !EVENT_TYPES.includes(type)) return jsonError("invalid_event_type", 400, { allowed: EVENT_TYPES });
+  // Same class of bug as imports/init: `${type || null} is null` left $2 with no
+  // inferable type -> "could not determine data type of parameter $2". Use an
+  // empty-string sentinel instead of NULL and cast both occurrences.
+  const filter = type ?? "";
+  const rows = await db(c.env)`select e.id,e.event_type,p.username,e.occurred_after,e.occurred_before,e.snapshot_id from events e join people p on p.id=e.person_id where e.account_id=${c.req.param("id")} and (${filter}::text='' or e.event_type=${filter}::text) and not exists(select 1 from exclusion_entries x where x.account_id=e.account_id and x.username=p.username) order by e.occurred_before desc limit ${limit}`;
   return c.json({ count: rows.length, changes: rows });
 });
 
@@ -300,7 +355,9 @@ app.post("/api/v1/accounts/:id/exclusions", async c => {
   if (users.length > asInt(c.env.MAX_EXCLUSION_COUNT, 100000)) return jsonError("exclusion_limit_exceeded", 413);
   const reason = String(body.reason || 'manually_excluded').slice(0, 80), sql = db(c.env);
   await sql`insert into exclusion_entries(account_id,username,reason) select ${c.req.param("id")}::uuid,value,${reason} from jsonb_array_elements_text(${JSON.stringify(users)}::jsonb) on conflict(account_id,username) do update set reason=excluded.reason,updated_at=now()`;
-  await sql`insert into audit_log(account_id,action,details) values(${c.req.param("id")},'exclusions_updated',jsonb_build_object('count',${users.length}))`;
+  // Same jsonb_build_object type-inference trap as imports/init: a bare number
+  // parameter has no inferable type. $2 is a count, so ::int is the right cast.
+  await sql`insert into audit_log(account_id,action,details) values(${c.req.param("id")}::uuid,'exclusions_updated',jsonb_build_object('count',${users.length}::int))`;
   return c.json({ added_or_updated: users.length, usernames: users });
 });
 
@@ -328,19 +385,44 @@ app.post("/api/v1/accounts/:id/exclusions/clear", async c => {
   return c.json({ deleted: result.length });
 });
 
-app.onError((e, c) => { console.error(e); return c.json({ error: "internal_error", message: e instanceof Error ? e.message : String(e) }, 500); });
+/**
+ * Keep failures debuggable ("could not determine data type of parameter $2" is
+ * the single most useful thing a user can be told) while never echoing a
+ * database DSN or credential back to the browser. The full error is always
+ * written to the Worker log.
+ */
+function safeMessage(e: unknown) {
+  const raw = e instanceof Error ? e.message : String(e);
+  return raw
+    .replace(/postgres(?:ql)?:\/\/\S+/gi, "[redacted-database-url]")
+    .replace(/\b(password|secret|api[_-]?key|token)\s*[=:]\s*\S+/gi, "$1=[redacted]")
+    .slice(0, 500);
+}
+
+app.onError((e, c) => {
+  console.error("unhandled request error", { path: c.req.path, method: c.req.method, error: e instanceof Error ? e.message : String(e) });
+  return c.json({ error: "internal_error", message: safeMessage(e) }, 500);
+});
 
 export default {
   fetch: app.fetch,
   async queue(batch: MessageBatch<ImportQueueMessage>, env: Env) {
     for (const message of batch.messages) {
+      const body = message.body as Partial<ImportQueueMessage> | undefined;
+      // Drop poison messages instead of burning all 10 retries on them.
+      if (!body || body.kind !== "finalize" || typeof body.importId !== "string" || !UUID_RE.test(body.importId)) {
+        console.error("queue: dropping malformed message", JSON.stringify(message.body));
+        message.ack();
+        continue;
+      }
       try {
-        if (message.body.kind === 'finalize') {
-          await finalize(env, message.body.importId);
-          message.ack();
-        } else message.ack();
+        const result = await finalize(env, body.importId);
+        // finalize_import() swallows its own errors and reports them in the
+        // imports row, so surface them in the log instead of losing them.
+        if (result?.status === "failed") console.error("queue: finalize_import failed", body.importId, result);
+        message.ack();
       } catch (error) {
-        console.error('queue import failure', message.body, error);
+        console.error("queue import failure", body, error);
         message.retry();
       }
     }
