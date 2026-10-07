@@ -1,0 +1,30 @@
+name = "instagram-history-tracker"
+main = "src/index.ts"
+compatibility_date = "2026-10-06"
+
+[vars]
+APP_NAME = "Instagram History Tracker"
+MAX_USERNAME_COUNT = "500000"
+MAX_EXCLUSION_COUNT = "100000"
+MAX_CHUNK_ITEMS = "5000"
+MAX_ZIP_FILES = "5000"
+
+[[queues.producers]]
+binding = "IMPORT_QUEUE"
+queue = "instagram-history-imports"
+
+[[queues.consumers]]
+queue = "instagram-history-imports"
+max_batch_size = 5
+max_batch_timeout = 2
+max_retries = 10
+dead_letter_queue = "instagram-history-imports-dlq"
+max_concurrency = 2
+retry_delay = 30
+
+[observability]
+enabled = true
+
+# Secrets:
+# wrangler secret put DATABASE_URL
+# wrangler secret put API_KEY
