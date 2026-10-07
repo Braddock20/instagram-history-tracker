@@ -310,7 +310,10 @@ app.get("/api/v1/accounts/:id/analytics/growth", async c => {
 });
 
 app.get("/api/v1/accounts/:id/analytics/churn", async c => {
-  const rows = await db(c.env)`select date_trunc('day',e.occurred_before) day,e.event_type,count(*)::int count from events e where e.account_id=${c.req.param("id")} and e.event_type in ('unfollowed_you','followed_you') and not exists(select 1 from exclusion_entries x join people p on p.account_id=x.account_id and p.username=x.username where x.account_id=e.account_id and p.id=e.person_id) group by 1,e.event_type order by 1 asc`;
+  // FIX: `day` is a reserved keyword in PostgreSQL. A bare `... ) day` alias is
+  // a PARSE error, so this route 500'd on every single call. Quoting keeps the
+  // JSON response key as "day" so the API contract is unchanged.
+  const rows = await db(c.env)`select date_trunc('day',e.occurred_before) as "day",e.event_type,count(*)::int as "count" from events e where e.account_id=${c.req.param("id")} and e.event_type in ('unfollowed_you','followed_you') and not exists(select 1 from exclusion_entries x join people p on p.account_id=x.account_id and p.username=x.username where x.account_id=e.account_id and p.id=e.person_id) group by 1,e.event_type order by 1 asc`;
   return c.json({ points: rows });
 });
 
@@ -381,7 +384,9 @@ app.delete("/api/v1/accounts/:id/exclusions/:username", async c => {
 });
 
 app.post("/api/v1/accounts/:id/exclusions/clear", async c => {
-  const result = await db(c.env)`delete from exclusion_entries where account_id=${c.req.param("id")}`;
+  // FIX: without RETURNING, the driver hands back an empty row set, so
+  // result.length was always 0 even though rows really were deleted.
+  const result = await db(c.env)`delete from exclusion_entries where account_id=${c.req.param("id")} returning id`;
   return c.json({ deleted: result.length });
 });
 
