@@ -477,6 +477,47 @@ describe("D. security & robustness (section 14)", () => {
     expect(((await res.json()) as any).error).not.toBe("internal_error");
   });
 
+  // --- regressions found only by testing the LIVE deployment ----------------
+  it("REGRESSION: /analytics/churn must not be a parse error ('day' is reserved)", async () => {
+    const acc = await q<{ id: string }>("select id from instagram_accounts limit 1");
+    // No events needed: the old query failed at PARSE time, i.e. on every call.
+    const r = await call("GET", `/api/v1/accounts/${acc[0].id}/analytics/churn`);
+    expect(r.status).toBe(200);
+    expect(r.body?.error).not.toBe("internal_error");
+    expect(Array.isArray(r.body?.points)).toBe(true);
+  });
+
+  it("REGRESSION: /analytics/churn returns real day buckets when events exist", async () => {
+    const acc = await q<{ id: string }>("select id from instagram_accounts where username='termux_test_2026'");
+    // Seed a follow/unfollow pair so churn has something to bucket.
+    const people = await q<{ id: string }>("select id from people where account_id=$1 limit 1", [acc[0].id]);
+    const snap = await q<{ id: string }>("select id from snapshots where account_id=$1 limit 1", [acc[0].id]);
+    if (people[0] && snap[0]) {
+      await q(
+        `insert into events(account_id,snapshot_id,person_id,event_type,occurred_before)
+         values($1,$2,$3,'followed_you',now()) on conflict do nothing`,
+        [acc[0].id, snap[0].id, people[0].id],
+      );
+    }
+    const r = await call("GET", `/api/v1/accounts/${acc[0].id}/analytics/churn`);
+    expect(r.status).toBe(200);
+    expect(r.body?.error).not.toBe("internal_error");
+    // The JSON key must stay "day" so existing consumers don't break.
+    for (const p of r.body?.points || []) expect(Object.keys(p)).toContain("day");
+  });
+
+  it("REGRESSION: exclusions/clear reports the real number deleted", async () => {
+    const acc = await q<{ id: string }>("select id from instagram_accounts where username='termux_test_2026'");
+    await call("POST", `/api/v1/accounts/${acc[0].id}/exclusions`, { usernames: ["a_one", "b_two"] });
+    const before = await call("GET", `/api/v1/accounts/${acc[0].id}/exclusions`);
+    expect(before.body.count).toBeGreaterThan(0);
+    const cleared = await call("POST", `/api/v1/accounts/${acc[0].id}/exclusions/clear`, {});
+    expect(cleared.status).toBe(200);
+    expect(cleared.body.deleted).toBe(before.body.count);
+    const after = await call("GET", `/api/v1/accounts/${acc[0].id}/exclusions`);
+    expect(after.body.count).toBe(0);
+  });
+
   it("a valid Instagram-shaped ZIP is parsed end to end by the server fallback", async () => {
     const { zipSync, strToU8 } = await import("fflate");
     const acc = await q<{ id: string }>("select id from instagram_accounts where username='second_account'");
